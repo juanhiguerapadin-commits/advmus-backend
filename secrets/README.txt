@@ -1,0 +1,13 @@
+advmus-backend/
+  app/
+    main.py
+    routers/
+      invoices.py
+    storage.py
+  secrets/
+    README.md
+  requirements.txt
+  Dockerfile
+  .dockerignore
+  .gitignore
+  .env.example

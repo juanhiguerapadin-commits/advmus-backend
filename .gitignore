@@ -1,0 +1,18 @@
+# env / secrets
+.env
+.env.*
+secrets/*
+!secrets/README.md
+!secrets/README.txt
+*.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+
+# local data
+data/
