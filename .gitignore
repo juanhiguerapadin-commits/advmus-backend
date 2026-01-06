@@ -1,18 +1,62 @@
+# =========================
 # env / secrets
+# =========================
 .env
 .env.*
+!.env.example
+
 secrets/*
 !secrets/README.md
 !secrets/README.txt
-*.json
 
+# JSON credentials / keys (NO ignorar todos los JSON)
+*service-account*.json
+*credentials*.json
+*client_secret*.json
+*firebase*.json
+*key*.json
+
+# =========================
 # python
+# =========================
 .venv/
 __pycache__/
 *.pyc
 
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# build artifacts
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
 # IDE
+# =========================
 .vscode/
 
+# =========================
+# logs
+# =========================
+*.log
+logs/
+
+# =========================
 # local data
+# =========================
 data/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+
