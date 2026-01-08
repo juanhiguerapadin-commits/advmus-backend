@@ -1,5 +1,6 @@
 import os
 import uuid
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -8,9 +9,19 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.auth import Principal, get_principal
-from app.db_firestore import get_invoice_metadata, list_invoices_metadata, upsert_invoice_metadata
+from app.db_firestore import (
+    get_invoice_metadata,
+    list_invoices_metadata,
+    upsert_invoice_metadata,
+    find_invoice_by_idempotency_key,
+    find_recent_invoice_by_content_hash,
+)
 from app.schemas import ALLOWED_STATUSES, ALLOWED_TRANSITIONS, InvoicePatch
-from app.storage import list_invoices_from_gcs, open_invoice_pdf_from_gcs, upload_invoice_pdf_to_gcs
+from app.storage import (
+    list_invoices_from_gcs,
+    open_invoice_pdf_from_gcs,
+    upload_invoice_pdf_to_gcs,
+)
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
@@ -27,6 +38,42 @@ def _utc_now_dt() -> datetime:
 def _safe_filename(name: Optional[str]) -> str:
     base = os.path.basename(name or "")
     return base[:200] if base else ""
+
+
+def _sha256_fileobj(fileobj, chunk_size: int = 1024 * 1024) -> str:
+    """
+    Calcula SHA-256 leyendo en chunks (stream), sin cargar todo el PDF en memoria.
+    """
+    h = hashlib.sha256()
+    pos = None
+    try:
+        pos = fileobj.tell()
+    except Exception:
+        pos = None
+
+    try:
+        try:
+            fileobj.seek(0)
+        except Exception:
+            pass
+
+        while True:
+            chunk = fileobj.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    finally:
+        try:
+            fileobj.seek(0)
+        except Exception:
+            pass
+        if pos is not None:
+            try:
+                fileobj.seek(pos)
+            except Exception:
+                pass
+
+    return h.hexdigest()
 
 
 @router.get("")
@@ -97,17 +144,39 @@ async def upload_invoice(
     if not is_pdf:
         raise HTTPException(status_code=415, detail="Only PDF invoices are supported.")
 
+    idem_key = (x_idempotency_key or "").strip() or None
+
+    # 1) Idempotency: si ya existe (tenant_id, idempotency_key) devolvemos el mismo invoice (no duplicamos)
+    if idem_key:
+        existing = await run_in_threadpool(find_invoice_by_idempotency_key, tenant_id, idem_key)
+        if existing:
+            return existing
+
+    # 2) Hash del contenido para dedupe real
+    await file.seek(0)
+    content_hash = await run_in_threadpool(_sha256_fileobj, file.file)
+    await file.seek(0)
+
+    # (bonus) Dedupe por contenido reciente: devolvemos 409 con invoice existente
+    dup = await run_in_threadpool(find_recent_invoice_by_content_hash, tenant_id, content_hash, 60)
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Duplicate content (recent)", "existing_invoice_id": dup.get("invoice_id")},
+        )
+
     invoice_id = uuid.uuid4().hex
     await file.seek(0)
 
     try:
+        # google-cloud-storage es sync -> threadpool
         gcs_info = await run_in_threadpool(
             upload_invoice_pdf_to_gcs,
             tenant_id,
             file,  # UploadFile (storage lee file.file)
             invoice_id,
             original_name,
-            (x_idempotency_key or "").strip() or None,
+            idem_key,
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tenant id format.")
@@ -131,6 +200,9 @@ async def upload_invoice(
         "updated": now_iso,
         "created_at": now_dt,
         "updated_at": now_dt,
+        # Dedupe / idempotency
+        "idempotency_key": idem_key,
+        "content_hash": content_hash,
     }
 
     await run_in_threadpool(upsert_invoice_metadata, tenant_id, invoice_id, meta)
