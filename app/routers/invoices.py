@@ -4,11 +4,12 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.auth import Principal, get_principal
+from app.core.errors import AppError
 from app.db_firestore import (
     get_invoice_metadata,
     list_invoices_metadata,
@@ -31,7 +32,6 @@ def _utc_now_iso() -> str:
 
 
 def _utc_now_dt() -> datetime:
-    # Firestore acepta datetime; mejor timezone-aware
     return datetime.now(timezone.utc)
 
 
@@ -124,7 +124,12 @@ async def get_invoice(invoice_id: str, principal: Principal = Depends(get_princi
     tenant_id = principal.tenant_id
     meta = await run_in_threadpool(get_invoice_metadata, tenant_id, invoice_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Invoice not found in metadata DB.")
+        raise AppError(
+            code="invoice_not_found",
+            message="Invoice not found in metadata DB.",
+            status_code=404,
+            details={"invoice_id": invoice_id},
+        )
     return meta
 
 
@@ -142,7 +147,12 @@ async def upload_invoice(
     # Aceptamos PDF por content-type o por extensión
     is_pdf = content_type in ("application/pdf", "application/x-pdf") or original_name.lower().endswith(".pdf")
     if not is_pdf:
-        raise HTTPException(status_code=415, detail="Only PDF invoices are supported.")
+        raise AppError(
+            code="unsupported_media_type",
+            message="Only PDF invoices are supported.",
+            status_code=415,
+            details={"expected": "application/pdf"},
+        )
 
     idem_key = (x_idempotency_key or "").strip() or None
 
@@ -160,9 +170,11 @@ async def upload_invoice(
     # (bonus) Dedupe por contenido reciente: devolvemos 409 con invoice existente
     dup = await run_in_threadpool(find_recent_invoice_by_content_hash, tenant_id, content_hash, 60)
     if dup:
-        raise HTTPException(
+        raise AppError(
+            code="invoice_duplicate_recent",
+            message="Duplicate content (recent).",
             status_code=409,
-            detail={"message": "Duplicate content (recent)", "existing_invoice_id": dup.get("invoice_id")},
+            details={"existing_invoice_id": dup.get("invoice_id")},
         )
 
     invoice_id = uuid.uuid4().hex
@@ -179,7 +191,11 @@ async def upload_invoice(
             idem_key,
         )
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid tenant id format.")
+        raise AppError(
+            code="tenant_id_invalid",
+            message="Invalid tenant id format.",
+            status_code=400,
+        )
     finally:
         await file.close()
 
@@ -219,7 +235,12 @@ async def patch_invoice(
 
     current = await run_in_threadpool(get_invoice_metadata, tenant_id, invoice_id)
     if not current:
-        raise HTTPException(status_code=404, detail="Invoice not found in metadata DB.")
+        raise AppError(
+            code="invoice_not_found",
+            message="Invoice not found in metadata DB.",
+            status_code=404,
+            details={"invoice_id": invoice_id},
+        )
 
     # Compat Pydantic v1/v2
     updates: Dict[str, Any] = (
@@ -229,21 +250,32 @@ async def patch_invoice(
     )
 
     if not updates:
-        raise HTTPException(status_code=400, detail="No fields provided.")
+        raise AppError(
+            code="patch_no_fields",
+            message="No fields provided.",
+            status_code=400,
+        )
 
     # ----- Workflow mínimo: validar status + transición -----
     if "status" in updates:
         new_status = updates["status"]
         if new_status not in ALLOWED_STATUSES:
-            raise HTTPException(status_code=400, detail="Invalid status.")
+            raise AppError(
+                code="status_invalid",
+                message="Invalid status.",
+                status_code=400,
+                details={"allowed": sorted(list(ALLOWED_STATUSES))},
+            )
 
         old_status = (current.get("status") or "uploaded")
         allowed_next = ALLOWED_TRANSITIONS.get(old_status, set())
 
         if new_status != old_status and new_status not in allowed_next:
-            raise HTTPException(
+            raise AppError(
+                code="status_transition_invalid",
+                message=f"Invalid status transition: {old_status} -> {new_status}",
                 status_code=400,
-                detail=f"Invalid status transition: {old_status} -> {new_status}",
+                details={"from": old_status, "to": new_status, "allowed_next": sorted(list(allowed_next))},
             )
 
     # Normalizaciones
@@ -272,9 +304,18 @@ def download_invoice(invoice_id: str, principal: Principal = Depends(get_princip
     try:
         stream, meta = open_invoice_pdf_from_gcs(tenant_id, invoice_id)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Invoice PDF not found.")
+        raise AppError(
+            code="invoice_pdf_not_found",
+            message="Invoice PDF not found.",
+            status_code=404,
+            details={"invoice_id": invoice_id},
+        )
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid tenant id format.")
+        raise AppError(
+            code="tenant_id_invalid",
+            message="Invalid tenant id format.",
+            status_code=400,
+        )
 
     filename = meta.get("original_filename") or f"{invoice_id}.pdf"
     headers = {"Content-Disposition": f'attachment; filename="{_safe_filename(filename) or (invoice_id + ".pdf")}"'}
