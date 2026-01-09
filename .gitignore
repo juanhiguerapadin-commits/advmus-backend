@@ -60,3 +60,8 @@ Thumbs.db
 Desktop.ini
 
 
+
+not_a_pdf.txt
+**/__pycache__/
+.venv/
+
