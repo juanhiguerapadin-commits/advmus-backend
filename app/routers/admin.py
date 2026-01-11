@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, Query
-from google.api_core.exceptions import AlreadyExists
-from google.cloud import firestore
 from pydantic import BaseModel, Field
+from google.cloud import firestore
+from google.api_core.exceptions import (
+    AlreadyExists,
+    PermissionDenied,
+    NotFound,
+    FailedPrecondition,
+    ServiceUnavailable,
+    GoogleAPICallError,
+)
 
-from app.auth import Principal, get_principal
+from app.auth import get_principal  # misma protección que invoices
 from app.core.errors import AppError
 
 TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$")
@@ -20,10 +27,15 @@ def _utcnow() -> datetime:
 
 
 def get_db() -> firestore.Client:
+    # toma credenciales ADC (gcloud app-default) + proyecto default de gcloud init
     return firestore.Client()
 
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(get_principal)],  # PROTEGE TODO /admin/*
+)
 
 
 class TenantCreate(BaseModel):
@@ -58,27 +70,69 @@ def _tenant_ref(db: firestore.Client, tenant_id: str):
     return db.collection("tenants").document(tenant_id)
 
 
-def _ensure_valid_tenant_id(tenant_id: str):
-    if not TENANT_ID_RE.match(tenant_id):
+def _map_firestore_error(e: Exception, *, action: str, tenant_id: Optional[str] = None):
+    details = {"action": action}
+    if tenant_id:
+        details["tenant_id"] = tenant_id
+
+    # Errores típicos (más informativos que 500)
+    if isinstance(e, PermissionDenied):
+        raise AppError(
+            code="PERMISSION_DENIED",
+            message="Firestore permission denied (check IAM roles for your account/project).",
+            status_code=403,
+            details=details,
+        )
+    if isinstance(e, FailedPrecondition):
+        raise AppError(
+            code="FIRESTORE_NOT_READY",
+            message="Firestore is not ready (API disabled or database not initialized).",
+            status_code=412,
+            details=details,
+        )
+    if isinstance(e, NotFound):
+        raise AppError(
+            code="NOT_FOUND",
+            message="Firestore resource not found.",
+            status_code=404,
+            details=details,
+        )
+    if isinstance(e, ServiceUnavailable):
+        raise AppError(
+            code="FIRESTORE_UNAVAILABLE",
+            message="Firestore temporarily unavailable.",
+            status_code=503,
+            details=details,
+        )
+    if isinstance(e, GoogleAPICallError):
+        # Cualquier otro error de Google API
+        details["google_error"] = str(e)
+        raise AppError(
+            code="FIRESTORE_ERROR",
+            message="Firestore request failed.",
+            status_code=502,
+            details=details,
+        )
+
+    # Fallback (mantiene robustez sin ocultar el contexto)
+    details["error"] = str(e)
+    raise AppError(
+        code="INTERNAL_ERROR",
+        message="Unexpected backend error.",
+        status_code=500,
+        details=details,
+    )
+
+
+@router.post("/tenants", response_model=TenantOut, status_code=201)
+def create_tenant(payload: TenantCreate):
+    if not TENANT_ID_RE.match(payload.tenant_id):
         raise AppError(
             code="VALIDATION_ERROR",
             message="Invalid tenant_id format",
             status_code=422,
-            details={"tenant_id": tenant_id},
+            details={"tenant_id": payload.tenant_id},
         )
-
-
-# (Futuro) si querés endurecer admin-only:
-# def _require_admin(principal: Principal):
-#     # Ajustar según campos reales del Principal (roles/is_admin/etc.)
-#     if not getattr(principal, "is_admin", False):
-#         raise AppError(code="FORBIDDEN", message="Admin required", status_code=403)
-
-
-@router.post("/tenants", response_model=TenantOut, status_code=201)
-def create_tenant(payload: TenantCreate, principal: Principal = Depends(get_principal)):
-    # _require_admin(principal)  # futuro
-    _ensure_valid_tenant_id(payload.tenant_id)
 
     db = get_db()
     created_at = _utcnow()
@@ -99,6 +153,8 @@ def create_tenant(payload: TenantCreate, principal: Principal = Depends(get_prin
             status_code=409,
             details={"tenant_id": payload.tenant_id},
         )
+    except Exception as e:
+        _map_firestore_error(e, action="create_tenant", tenant_id=payload.tenant_id)
 
     return TenantOut(
         tenant_id=payload.tenant_id,
@@ -108,18 +164,21 @@ def create_tenant(payload: TenantCreate, principal: Principal = Depends(get_prin
 
 
 @router.post("/users", response_model=AdminUserOut, status_code=201)
-def create_user(payload: AdminUserCreate, principal: Principal = Depends(get_principal)):
-    # _require_admin(principal)  # futuro
-
+def create_user(payload: AdminUserCreate):
     db = get_db()
 
-    if not _tenant_ref(db, payload.tenant_id).get().exists:
-        raise AppError(
-            code="TENANT_NOT_FOUND",
-            message="Tenant not found",
-            status_code=404,
-            details={"tenant_id": payload.tenant_id},
-        )
+    try:
+        if not _tenant_ref(db, payload.tenant_id).get().exists:
+            raise AppError(
+                code="TENANT_NOT_FOUND",
+                message="Tenant not found",
+                status_code=404,
+                details={"tenant_id": payload.tenant_id},
+            )
+    except AppError:
+        raise
+    except Exception as e:
+        _map_firestore_error(e, action="check_tenant_exists", tenant_id=payload.tenant_id)
 
     created_at = _utcnow()
     user_ref = _tenant_ref(db, payload.tenant_id).collection("users").document(payload.user_id)
@@ -143,6 +202,8 @@ def create_user(payload: AdminUserCreate, principal: Principal = Depends(get_pri
             status_code=409,
             details={"tenant_id": payload.tenant_id, "user_id": payload.user_id},
         )
+    except Exception as e:
+        _map_firestore_error(e, action="create_user", tenant_id=payload.tenant_id)
 
     return AdminUserOut(
         tenant_id=payload.tenant_id,
@@ -155,21 +216,22 @@ def create_user(payload: AdminUserCreate, principal: Principal = Depends(get_pri
 
 
 @router.get("/tenants", response_model=List[TenantOut])
-def list_tenants(limit: int = Query(default=100, ge=1, le=500), principal: Principal = Depends(get_principal)):
-    # _require_admin(principal)  # futuro
+def list_tenants(limit: int = Query(default=100, ge=1, le=500)):
     db = get_db()
-
     out: List[TenantOut] = []
-    for d in db.collection("tenants").limit(limit).stream():
-        data = d.to_dict() or {}
-        ca = data.get("created_at")
-        out.append(
-            TenantOut(
-                tenant_id=data.get("tenant_id", d.id),
-                display_name=data.get("display_name"),
-                created_at=ca.isoformat() if hasattr(ca, "isoformat") else str(ca),
+    try:
+        for d in db.collection("tenants").limit(limit).stream():
+            data = d.to_dict() or {}
+            ca = data.get("created_at")
+            out.append(
+                TenantOut(
+                    tenant_id=data.get("tenant_id", d.id),
+                    display_name=data.get("display_name"),
+                    created_at=ca.isoformat() if hasattr(ca, "isoformat") else str(ca),
+                )
             )
-        )
+    except Exception as e:
+        _map_firestore_error(e, action="list_tenants")
     return out
 
 
@@ -177,31 +239,38 @@ def list_tenants(limit: int = Query(default=100, ge=1, le=500), principal: Princ
 def list_users(
     tenant_id: str = Query(..., min_length=2, max_length=64),
     limit: int = Query(default=200, ge=1, le=500),
-    principal: Principal = Depends(get_principal),
 ):
-    # _require_admin(principal)  # futuro
     db = get_db()
 
-    if not _tenant_ref(db, tenant_id).get().exists:
-        raise AppError(
-            code="TENANT_NOT_FOUND",
-            message="Tenant not found",
-            status_code=404,
-            details={"tenant_id": tenant_id},
-        )
+    try:
+        if not _tenant_ref(db, tenant_id).get().exists:
+            raise AppError(
+                code="TENANT_NOT_FOUND",
+                message="Tenant not found",
+                status_code=404,
+                details={"tenant_id": tenant_id},
+            )
+    except AppError:
+        raise
+    except Exception as e:
+        _map_firestore_error(e, action="check_tenant_exists", tenant_id=tenant_id)
 
     out: List[AdminUserOut] = []
-    for d in _tenant_ref(db, tenant_id).collection("users").limit(limit).stream():
-        data = d.to_dict() or {}
-        ca = data.get("created_at")
-        out.append(
-            AdminUserOut(
-                tenant_id=data.get("tenant_id", tenant_id),
-                user_id=data.get("user_id", d.id),
-                role=data.get("role", "member"),
-                email=data.get("email"),
-                full_name=data.get("full_name"),
-                created_at=ca.isoformat() if hasattr(ca, "isoformat") else str(ca),
+    try:
+        for d in _tenant_ref(db, tenant_id).collection("users").limit(limit).stream():
+            data = d.to_dict() or {}
+            ca = data.get("created_at")
+            out.append(
+                AdminUserOut(
+                    tenant_id=data.get("tenant_id", tenant_id),
+                    user_id=data.get("user_id", d.id),
+                    role=data.get("role", "member"),
+                    email=data.get("email"),
+                    full_name=data.get("full_name"),
+                    created_at=ca.isoformat() if hasattr(ca, "isoformat") else str(ca),
+                )
             )
-        )
+    except Exception as e:
+        _map_firestore_error(e, action="list_users", tenant_id=tenant_id)
+
     return out
