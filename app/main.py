@@ -1,8 +1,10 @@
 import logging
+import os
 import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -13,8 +15,30 @@ from app.routers.invoices import router as invoices_router
 
 logger = logging.getLogger("app")
 
+
+def _cors_origins() -> list[str]:
+    """
+    CSV en env var:
+      CORS_ALLOW_ORIGINS="http://localhost:3000,http://localhost:5173,https://app.advmus.com"
+    """
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000,http://localhost:5173")
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
 app = FastAPI(title="AdVMus API", version="0.1.0")
+
+# Middlewares (CORS debe ir "por fuera" para manejar preflight antes que auth/routers)
 app.add_middleware(RequestIdMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Request-Id"],
+    max_age=600,
+)
 
 
 @app.middleware("http")
@@ -30,7 +54,11 @@ async def ensure_request_id_header(request: Request, call_next):
         request.state.request_id = rid
 
     response = await call_next(request)
-    response.headers["X-Request-Id"] = rid
+
+    # No pisar si algún middleware ya lo puso
+    if "X-Request-Id" not in response.headers:
+        response.headers["X-Request-Id"] = rid
+
     return response
 
 
@@ -55,7 +83,7 @@ async def app_error_handler(request: Request, exc: AppError):
 @app.exception_handler(StarletteHTTPException)
 async def http_exc_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
-        status_code_toggle=exc.status_code,
+        status_code=exc.status_code,
         content=_err("HTTP_ERROR", str(exc.detail), request),
     )
 

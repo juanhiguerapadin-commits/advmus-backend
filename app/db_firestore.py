@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
@@ -8,32 +8,80 @@ from google.cloud import firestore
 _db: Optional[firestore.Client] = None
 
 
-def _utc_now() -> datetime:
-    # Firestore maneja timestamps; datetime naive se interpreta como UTC
-    return datetime.utcnow()
-
-
 def get_db() -> firestore.Client:
+    """Singleton Firestore client. En Cloud Run usa el service account (ADC)."""
     global _db
     if _db is None:
         _db = firestore.Client()
     return _db
 
 
+def invoices_col(tenant_id: str) -> firestore.CollectionReference:
+    return get_db().collection("tenants").document(tenant_id).collection("invoices")
+
+
 def invoice_doc_ref(tenant_id: str, invoice_id: str) -> firestore.DocumentReference:
-    db = get_db()
-    return (
-        db.collection("tenants")
-        .document(tenant_id)
-        .collection("invoices")
-        .document(invoice_id)
-    )
+    return invoices_col(tenant_id).document(invoice_id)
+
+
+def create_invoice(tenant_id: str, invoice_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Crea el documento inicial (ideal en upload si quisieras modo "create only").
+    """
+    ref = invoice_doc_ref(tenant_id, invoice_id)
+
+    payload: Dict[str, Any] = {
+        **data,
+        "tenant_id": tenant_id,
+        "invoice_id": invoice_id,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    ref.set(payload, merge=False)
+    return payload
+
+
+@firestore.transactional
+def _upsert_txn(
+    transaction: firestore.Transaction,
+    ref: firestore.DocumentReference,
+    tenant_id: str,
+    invoice_id: str,
+    data: Dict[str, Any],
+) -> None:
+    snap = ref.get(transaction=transaction)
+    existing = snap.to_dict() if snap.exists else {}
+
+    patch: Dict[str, Any] = {
+        **data,
+        "tenant_id": tenant_id,
+        "invoice_id": invoice_id,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    # Seteamos created_at solo si no existe (no lo pisamos en updates).
+    if not existing or "created_at" not in existing:
+        patch["created_at"] = firestore.SERVER_TIMESTAMP
+
+    transaction.set(ref, patch, merge=True)
 
 
 def upsert_invoice_metadata(tenant_id: str, invoice_id: str, data: Dict[str, Any]) -> None:
-    # Merge=True para no pisar campos si en el futuro agregamos más cosas (parsed, amount, due_date, etc.)
+    """
+    Upsert con merge=True y timestamps correctos.
+    No pisa created_at si ya existe.
+    """
     ref = invoice_doc_ref(tenant_id, invoice_id)
-    ref.set(data, merge=True)
+    tx = get_db().transaction()
+    _upsert_txn(tx, ref, tenant_id, invoice_id, data)
+
+
+def patch_invoice_metadata(tenant_id: str, invoice_id: str, patch: Dict[str, Any]) -> None:
+    """
+    Patch rápido: solo updates. Ideal para status, docai_job_id, etc.
+    """
+    ref = invoice_doc_ref(tenant_id, invoice_id)
+    ref.update({**patch, "updated_at": firestore.SERVER_TIMESTAMP})
 
 
 def get_invoice_metadata(tenant_id: str, invoice_id: str) -> Optional[Dict[str, Any]]:
@@ -41,16 +89,16 @@ def get_invoice_metadata(tenant_id: str, invoice_id: str) -> Optional[Dict[str, 
     snap = ref.get()
     if not snap.exists:
         return None
+
     d = snap.to_dict() or {}
+    d.setdefault("invoice_id", snap.id)
+    d.setdefault("tenant_id", tenant_id)
     return d
 
 
 def list_invoices_metadata(tenant_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    db = get_db()
     q = (
-        db.collection("tenants")
-        .document(tenant_id)
-        .collection("invoices")
+        invoices_col(tenant_id)
         .order_by("updated_at", direction=firestore.Query.DESCENDING)
         .limit(limit)
     )
@@ -58,26 +106,11 @@ def list_invoices_metadata(tenant_id: str, limit: int = 50) -> List[Dict[str, An
     out: List[Dict[str, Any]] = []
     for snap in q.stream():
         d = snap.to_dict() or {}
+        d.setdefault("invoice_id", snap.id)
+        d.setdefault("tenant_id", tenant_id)
         out.append(d)
+
     return out
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
-
-from google.cloud import firestore
-
-_db = None
-
-
-def _client():
-    global _db
-    if _db is None:
-        _db = firestore.Client()
-    return _db
-
-
-def _invoices_col(tenant_id: str):
-    # Estructura multi-tenant
-    return _client().collection("tenants").document(tenant_id).collection("invoices")
 
 
 def find_invoice_by_idempotency_key(tenant_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
@@ -85,11 +118,33 @@ def find_invoice_by_idempotency_key(tenant_id: str, idempotency_key: str) -> Opt
     if not key:
         return None
 
-    q = _invoices_col(tenant_id).where("idempotency_key", "==", key).limit(1)
-    docs = list(q.stream())
-    if not docs:
+    q = invoices_col(tenant_id).where("idempotency_key", "==", key).limit(1)
+    snaps = list(q.stream())
+    if not snaps:
         return None
-    return docs[0].to_dict()
+
+    snap = snaps[0]
+    d = snap.to_dict() or {}
+    d.setdefault("invoice_id", snap.id)
+    d.setdefault("tenant_id", tenant_id)
+    return d
+
+
+def find_invoice_by_sha256(tenant_id: str, sha256: str) -> Optional[Dict[str, Any]]:
+    h = (sha256 or "").strip()
+    if not h:
+        return None
+
+    q = invoices_col(tenant_id).where("sha256", "==", h).limit(1)
+    snaps = list(q.stream())
+    if not snaps:
+        return None
+
+    snap = snaps[0]
+    d = snap.to_dict() or {}
+    d.setdefault("invoice_id", snap.id)
+    d.setdefault("tenant_id", tenant_id)
+    return d
 
 
 def find_recent_invoice_by_content_hash(
@@ -97,29 +152,37 @@ def find_recent_invoice_by_content_hash(
     content_hash: str,
     window_minutes: int = 60,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Dedupe “reciente” sin exigir índices compuestos:
+    - query por igualdad (content_hash)
+    - filtro por ventana en Python
+    """
     h = (content_hash or "").strip()
     if not h:
         return None
 
-    # Buscamos el más reciente con ese hash (Firestore index normal para single-field)
-    q = _invoices_col(tenant_id).where("content_hash", "==", h).limit(5)
+    q = invoices_col(tenant_id).where("content_hash", "==", h).limit(10)
     docs = list(q.stream())
     if not docs:
         return None
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
 
-    # Filtramos “reciente” en Python para evitar requerir índices compuestos por ahora
-    best = None
-    best_ts = None
-    for d in docs:
-        data = d.to_dict() or {}
+    best: Optional[Dict[str, Any]] = None
+    best_ts: Optional[datetime] = None
+
+    for snap in docs:
+        data = snap.to_dict() or {}
         ts = data.get("created_at") or data.get("updated_at")
+
         if isinstance(ts, datetime):
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+
             if ts >= cutoff and (best_ts is None or ts > best_ts):
                 best = data
                 best_ts = ts
+                best.setdefault("invoice_id", snap.id)
+                best.setdefault("tenant_id", tenant_id)
 
     return best

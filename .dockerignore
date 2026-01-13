@@ -1,11 +1,23 @@
-.venv
-__pycache__
+# Python
+.venv/
+**/__pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Env / secrets
 .env
 .env.*
-secrets
-.vscode
-data
-.git
-*.log
+env.yaml
+secrets/
 
+# IDE / Git
+.vscode/
+.git/
+.gitattributes
+.gitignore
+
+# Local data / logs
+data/
+logs/
+*.log

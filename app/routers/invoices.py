@@ -1,6 +1,6 @@
+import hashlib
 import os
 import uuid
-import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -11,11 +11,11 @@ from fastapi.responses import StreamingResponse
 from app.auth import Principal, get_principal
 from app.core.errors import AppError
 from app.db_firestore import (
+    find_invoice_by_idempotency_key,
+    find_recent_invoice_by_content_hash,
     get_invoice_metadata,
     list_invoices_metadata,
     upsert_invoice_metadata,
-    find_invoice_by_idempotency_key,
-    find_recent_invoice_by_content_hash,
 )
 from app.schemas import ALLOWED_STATUSES, ALLOWED_TRANSITIONS, InvoicePatch
 from app.storage import (
@@ -26,25 +26,37 @@ from app.storage import (
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
+PDF_MIME_TYPES = {"application/pdf", "application/x-pdf"}
+DEDUPE_WINDOW_MINUTES = 60
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _utc_now_dt() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _safe_filename(name: Optional[str]) -> str:
-    base = os.path.basename(name or "")
-    return base[:200] if base else ""
+    """
+    Sanitiza para usar en Content-Disposition:
+    - basename
+    - sin CR/LF (header injection)
+    - sin comillas dobles
+    - truncado
+    """
+    base = os.path.basename(name or "").strip()
+    if not base:
+        return ""
+    base = base.replace("\r", "").replace("\n", "").replace('"', "'")
+    return base[:200]
 
 
 def _sha256_fileobj(fileobj, chunk_size: int = 1024 * 1024) -> str:
     """
     Calcula SHA-256 leyendo en chunks (stream), sin cargar todo el PDF en memoria.
+    Intenta restaurar el puntero al final.
     """
     h = hashlib.sha256()
+
+    # Guardar posición si es posible
     pos = None
     try:
         pos = fileobj.tell()
@@ -63,6 +75,7 @@ def _sha256_fileobj(fileobj, chunk_size: int = 1024 * 1024) -> str:
                 break
             h.update(chunk)
     finally:
+        # Volver a 0 y restaurar posición si existía
         try:
             fileobj.seek(0)
         except Exception:
@@ -87,31 +100,28 @@ async def get_invoices(principal: Principal = Depends(get_principal)):
     # 2) Si Firestore está vacío, fallback a GCS y bootstrap a metadata
     if not items:
         gcs_items = await run_in_threadpool(list_invoices_from_gcs, tenant_id)
+        now_iso = _utc_now_iso()
 
         for it in gcs_items:
             invoice_id = it.get("invoice_id")
             if not invoice_id:
                 continue
 
-            now_iso = _utc_now_iso()
-            now_dt = _utc_now_dt()
-
             meta = {
                 "tenant_id": tenant_id,
                 "invoice_id": invoice_id,
                 "original_filename": it.get("original_filename"),
+                "content_type": it.get("content_type") or "application/pdf",
                 "bytes": it.get("bytes"),
                 "gcs_bucket": it.get("gcs_bucket"),
                 "gcs_object": it.get("gcs_object"),
                 "gcs_uri": it.get("gcs_uri"),
                 "status": it.get("status") or "uploaded",
                 # timestamps para API
-                "created": it.get("updated") or now_iso,
+                "created": it.get("created") or it.get("updated") or now_iso,
                 "updated": it.get("updated") or now_iso,
-                # timestamps para Firestore (ordenables)
-                "created_at": now_dt,
-                "updated_at": now_dt,
             }
+
             await run_in_threadpool(upsert_invoice_metadata, tenant_id, invoice_id, meta)
 
         items = await run_in_threadpool(list_invoices_metadata, tenant_id, 50)
@@ -145,7 +155,7 @@ async def upload_invoice(
     content_type = (file.content_type or "").lower()
 
     # Aceptamos PDF por content-type o por extensión
-    is_pdf = content_type in ("application/pdf", "application/x-pdf") or original_name.lower().endswith(".pdf")
+    is_pdf = (content_type in PDF_MIME_TYPES) or original_name.lower().endswith(".pdf")
     if not is_pdf:
         raise AppError(
             code="unsupported_media_type",
@@ -164,11 +174,16 @@ async def upload_invoice(
 
     # 2) Hash del contenido para dedupe real
     await file.seek(0)
-    content_hash = await run_in_threadpool(_sha256_fileobj, file.file)
+    sha256_hex = await run_in_threadpool(_sha256_fileobj, file.file)
     await file.seek(0)
 
-    # (bonus) Dedupe por contenido reciente: devolvemos 409 con invoice existente
-    dup = await run_in_threadpool(find_recent_invoice_by_content_hash, tenant_id, content_hash, 60)
+    # Dedupe por contenido reciente
+    dup = await run_in_threadpool(
+        find_recent_invoice_by_content_hash,
+        tenant_id,
+        sha256_hex,
+        DEDUPE_WINDOW_MINUTES,
+    )
     if dup:
         raise AppError(
             code="invoice_duplicate_recent",
@@ -200,7 +215,6 @@ async def upload_invoice(
         await file.close()
 
     now_iso = _utc_now_iso()
-    now_dt = _utc_now_dt()
 
     meta = {
         "tenant_id": tenant_id,
@@ -214,11 +228,11 @@ async def upload_invoice(
         "status": "uploaded",
         "created": now_iso,
         "updated": now_iso,
-        "created_at": now_dt,
-        "updated_at": now_dt,
-        # Dedupe / idempotency
+        # Idempotencia / dedupe
         "idempotency_key": idem_key,
-        "content_hash": content_hash,
+        "content_hash": sha256_hex,  # usado por find_recent_invoice_by_content_hash
+        "sha256": sha256_hex,        # campo estándar para futuro
+        "source": "web",
     }
 
     await run_in_threadpool(upsert_invoice_metadata, tenant_id, invoice_id, meta)
@@ -275,7 +289,11 @@ async def patch_invoice(
                 code="status_transition_invalid",
                 message=f"Invalid status transition: {old_status} -> {new_status}",
                 status_code=400,
-                details={"from": old_status, "to": new_status, "allowed_next": sorted(list(allowed_next))},
+                details={
+                    "from": old_status,
+                    "to": new_status,
+                    "allowed_next": sorted(list(allowed_next)),
+                },
             )
 
     # Normalizaciones
@@ -286,9 +304,7 @@ async def patch_invoice(
         # llega como date -> guardamos ISO
         updates["due_date"] = updates["due_date"].isoformat()
 
-    now_iso = _utc_now_iso()
-    updates["updated"] = now_iso
-    updates["updated_at"] = _utc_now_dt()
+    updates["updated"] = _utc_now_iso()
 
     await run_in_threadpool(upsert_invoice_metadata, tenant_id, invoice_id, updates)
 
@@ -301,8 +317,18 @@ async def patch_invoice(
 def download_invoice(invoice_id: str, principal: Principal = Depends(get_principal)):
     tenant_id = principal.tenant_id
 
+    # Validación: si no existe metadata, es 404 (y evita leaks multi-tenant)
+    meta_db = get_invoice_metadata(tenant_id, invoice_id)
+    if not meta_db:
+        raise AppError(
+            code="invoice_not_found",
+            message="Invoice not found in metadata DB.",
+            status_code=404,
+            details={"invoice_id": invoice_id},
+        )
+
     try:
-        stream, meta = open_invoice_pdf_from_gcs(tenant_id, invoice_id)
+        stream, meta_gcs = open_invoice_pdf_from_gcs(tenant_id, invoice_id)
     except FileNotFoundError:
         raise AppError(
             code="invoice_pdf_not_found",
@@ -317,6 +343,8 @@ def download_invoice(invoice_id: str, principal: Principal = Depends(get_princip
             status_code=400,
         )
 
-    filename = meta.get("original_filename") or f"{invoice_id}.pdf"
-    headers = {"Content-Disposition": f'attachment; filename="{_safe_filename(filename) or (invoice_id + ".pdf")}"'}
+    filename = meta_db.get("original_filename") or meta_gcs.get("original_filename") or f"{invoice_id}.pdf"
+    safe = _safe_filename(filename) or (invoice_id + ".pdf")
+
+    headers = {"Content-Disposition": f'attachment; filename="{safe}"'}
     return StreamingResponse(stream, media_type="application/pdf", headers=headers)

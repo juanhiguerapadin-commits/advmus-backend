@@ -4,11 +4,17 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 from fastapi import Header, HTTPException, status
 
 TENANT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+# Cache (por proceso) para no parsear env/JSON en cada request
+_KEYS_LOADED = False
+_API_KEYS_MAP: Dict[str, str] = {}
+_SINGLE_API_KEY: Optional[str] = None
+_API_KEYS_LIST: Set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -17,7 +23,7 @@ class Principal:
     auth_mode: str  # "api_key" | "firebase" | "none"
 
 
-def _load_api_keys_map() -> Dict[str, str]:
+def _load_api_keys_map_from_env() -> Dict[str, str]:
     """
     Multi-tenant API keys.
     Expected env:
@@ -36,16 +42,18 @@ def _load_api_keys_map() -> Dict[str, str]:
     if not isinstance(data, dict):
         return {}
 
-    # Normalizamos a str->str
     out: Dict[str, str] = {}
     for k, v in data.items():
         if k is None or v is None:
             continue
-        out[str(k).strip()] = str(v).strip()
+        kk = str(k).strip()
+        vv = str(v).strip()
+        if kk and vv:
+            out[kk] = vv
     return out
 
 
-def _load_single_api_key() -> Optional[str]:
+def _load_single_api_key_from_env() -> Optional[str]:
     """
     Single API key (dev/simple).
     Env:
@@ -55,7 +63,7 @@ def _load_single_api_key() -> Optional[str]:
     return key or None
 
 
-def _load_api_keys_list() -> Set[str]:
+def _load_api_keys_list_from_env() -> Set[str]:
     """
     Optional: comma-separated keys.
     Env:
@@ -67,6 +75,20 @@ def _load_api_keys_list() -> Set[str]:
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
+def _get_keys_config() -> Tuple[Dict[str, str], Optional[str], Set[str]]:
+    """
+    Carga y cachea env vars de auth 1 sola vez por proceso.
+    En Cloud Run esto es perfecto (env no cambia “en caliente”).
+    """
+    global _KEYS_LOADED, _API_KEYS_MAP, _SINGLE_API_KEY, _API_KEYS_LIST
+    if not _KEYS_LOADED:
+        _API_KEYS_MAP = _load_api_keys_map_from_env()
+        _SINGLE_API_KEY = _load_single_api_key_from_env()
+        _API_KEYS_LIST = _load_api_keys_list_from_env()
+        _KEYS_LOADED = True
+    return _API_KEYS_MAP, _SINGLE_API_KEY, _API_KEYS_LIST
+
+
 def _require_tenant(x_tenant_id: Optional[str]) -> str:
     tenant_id = (x_tenant_id or "").strip()
     if not tenant_id:
@@ -76,10 +98,7 @@ def _require_tenant(x_tenant_id: Optional[str]) -> str:
     return tenant_id
 
 
-def _require_api_key(
-    tenant_id: str,
-    x_api_key: Optional[str],
-) -> None:
+def _require_api_key(tenant_id: str, x_api_key: Optional[str]) -> None:
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,9 +106,9 @@ def _require_api_key(
         )
 
     provided = str(x_api_key).strip()
+    keys_map, single, keys_list = _get_keys_config()
 
     # 1) Multi-tenant map (preferred)
-    keys_map = _load_api_keys_map()
     if keys_map:
         expected = keys_map.get(tenant_id)
         if expected and hmac.compare_digest(str(expected), provided):
@@ -100,13 +119,11 @@ def _require_api_key(
         )
 
     # 2) Single key (simple dev)
-    single = _load_single_api_key()
     if single and hmac.compare_digest(single, provided):
         return
 
-    # 3) Comma list (optional)
-    keys_list = _load_api_keys_list()
-    if keys_list and provided in keys_list:
+    # 3) Comma list (optional) - compare_digest para consistencia
+    if keys_list and any(hmac.compare_digest(k, provided) for k in keys_list):
         return
 
     # 4) Nothing configured -> server misconfigured
@@ -139,7 +156,7 @@ async def get_principal(
         return Principal(tenant_id=tenant_id, auth_mode="api_key")
 
     if mode == "firebase":
-        # Stub: validación real mañana (JWT verify + claims)
+        # Stub: validación real después (JWT verify + claims)
         if not authorization or not authorization.lower().startswith("bearer "):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

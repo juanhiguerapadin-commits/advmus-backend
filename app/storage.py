@@ -4,19 +4,31 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
-from google.cloud import storage
 from google.api_core.exceptions import NotFound
+from google.cloud import storage
+
+
+# -------------------------
+# Constants
+# -------------------------
+
+PDF_CONTENT_TYPE = "application/pdf"
+_TENANT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
 
 
 # -------------------------
 # Helpers
 # -------------------------
 
-_TENANT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
-
-
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _iso_z(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    # dt suele venir tz-aware; normalizamos igual
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _require_env(name: str) -> str:
@@ -111,11 +123,14 @@ def upload_invoice_pdf_to_gcs(
     - Dest: tenants/<tenant>/invoices/<invoice_id>.pdf
     - Stores minimal useful metadata on the object (no invoices.json registry).
     """
+    tenant_id = _sanitize_tenant_id(tenant_id)
+    invoice_id = _sanitize_invoice_id(invoice_id)
+
     bucket = get_bucket()
     object_name = _invoice_object_name(tenant_id, invoice_id)
     blob = bucket.blob(object_name)
 
-    blob.content_type = "application/pdf"
+    blob.content_type = PDF_CONTENT_TYPE
 
     # GCS metadata values should be strings; avoid writing None
     md: dict[str, str] = {
@@ -135,7 +150,7 @@ def upload_invoice_pdf_to_gcs(
     blob.upload_from_file(
         upload_file.file,
         rewind=True,
-        content_type="application/pdf",
+        content_type=PDF_CONTENT_TYPE,
     )
     blob.reload()
 
@@ -144,7 +159,7 @@ def upload_invoice_pdf_to_gcs(
         "object_name": object_name,
         "gcs_uri": f"gs://{bucket.name}/{object_name}",
         "bytes": blob.size,
-        "updated": _utc_now_iso(),
+        "updated": _iso_z(blob.updated) or _utc_now_iso(),
     }
 
 
@@ -154,6 +169,9 @@ def open_invoice_pdf_from_gcs(tenant_id: str, invoice_id: str) -> Tuple[Any, dic
     Returns (stream, meta).
     Raises FileNotFoundError if not found.
     """
+    tenant_id = _sanitize_tenant_id(tenant_id)
+    invoice_id = _sanitize_invoice_id(invoice_id)
+
     bucket = get_bucket()
     object_name = _invoice_object_name(tenant_id, invoice_id)
     blob = bucket.blob(object_name)
@@ -168,7 +186,7 @@ def open_invoice_pdf_from_gcs(tenant_id: str, invoice_id: str) -> Tuple[Any, dic
         "invoice_id": invoice_id,
         "tenant_id": tenant_id,
         "bytes": blob.size,
-        "updated": blob.updated.isoformat().replace("+00:00", "Z") if blob.updated else None,
+        "updated": _iso_z(blob.updated),
         "original_filename": md.get("original_filename"),
         "gcs_object": object_name,
         "gcs_uri": f"gs://{bucket.name}/{object_name}",
@@ -196,17 +214,19 @@ def list_invoices_from_gcs(tenant_id: str) -> list[dict[str, Any]]:
         invoice_id = name.split("/")[-1].removesuffix(".pdf")
         md = blob.metadata or {}
 
-        items.append({
-            "tenant_id": tenant_id,
-            "invoice_id": invoice_id,
-            "bytes": blob.size,
-            "updated": blob.updated.isoformat().replace("+00:00", "Z") if blob.updated else None,
-            "original_filename": md.get("original_filename"),
-            "gcs_bucket": bucket.name,
-            "gcs_object": name,
-            "gcs_uri": f"gs://{bucket.name}/{name}",
-            "status": "uploaded",
-        })
+        items.append(
+            {
+                "tenant_id": tenant_id,
+                "invoice_id": invoice_id,
+                "bytes": blob.size,
+                "updated": _iso_z(blob.updated),
+                "original_filename": md.get("original_filename"),
+                "gcs_bucket": bucket.name,
+                "gcs_object": name,
+                "gcs_uri": f"gs://{bucket.name}/{name}",
+                "status": "uploaded",
+            }
+        )
 
     items.sort(key=lambda x: x.get("updated") or "", reverse=True)
     return items
