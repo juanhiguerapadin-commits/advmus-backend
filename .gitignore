@@ -3,7 +3,6 @@
 # =========================
 .env
 .env.*
-env.yaml
 !.env.example
 
 secrets/*
@@ -21,8 +20,8 @@ secrets/*
 # python
 # =========================
 .venv/
-**/__pycache__/
-*.py[cod]
+__pycache__/
+*.pyc
 
 .pytest_cache/
 .mypy_cache/
@@ -60,5 +59,11 @@ data/
 Thumbs.db
 Desktop.ini
 
-# Local test artifact (si lo usás para pruebas)
+
+
 not_a_pdf.txt
+**/__pycache__/
+.venv/
+
+advmus-backend*.zip
+advmus-backend*.zip
